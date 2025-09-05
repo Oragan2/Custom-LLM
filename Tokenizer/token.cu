@@ -12,14 +12,15 @@
 
 std::vector<uint64_t> merges; // Store the merges
 std::map<std::string, int> vocab; // Store the tokens and their ids
-std::map<int, std::string> i_vocab; // Store the tokens and their ids
+std::map<int, std::string> i_vocab; // Store the ids and their token
 int batch_size = 1024 * 1024 * 4; // 4MB batch
 std::vector<std::vector<uint32_t>> corpus_batches; // Store the batches of the corpus
 // Allocate GPU memory
 uint32_t* d_corpus;
 uint32_t* d_hash_t;
 uint64_t* d_pairs_table;
-int* keep;
+uint32_t* new_corpus;
+uint32_t* place;
 const size_t table_size = 200000000; // number of slots
 int new_token_id = 0;
 struct is_one {
@@ -57,42 +58,23 @@ __global__ void GeneratePairs(uint32_t* corpus, uint32_t* hashs, uint64_t* hash_
 	}
 }
 
-__global__ void mergeAndUpdateHash(uint32_t* corpus, uint32_t* hashs, uint64_t* hash_p, size_t N, uint32_t new_token, uint64_t best_pair, int* keep) {
+__global__ void findBest(uint32_t* corpus, uint64_t best_pair, uint32_t* place, int N) {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	int stride = blockDim.x * gridDim.x;
 
 	for (size_t i = idx; i < N - 1; i += stride) {
 		uint64_t pair = ((uint64_t)corpus[i] << 32) | (uint64_t)corpus[i + 1];
 		if (pair == best_pair) {
-			corpus[i] = new_token;
-			keep[i] = 1; keep[i+1] = 0;
-			uint64_t hash_idx = hash64(pair) % 200000000;
-			atomicAdd(&hashs[hash_idx], -1);
-			if (i > 0) {
-				uint64_t pair_t = ((uint64_t)corpus[i-1] << 32) | (uint64_t)corpus[i];
-				uint64_t hash_idx = hash64(pair_t) % 200000000;
-				atomicAdd(&hashs[hash_idx], -1);
-				uint64_t pair_n = ((uint64_t)corpus[i-1] << 32) | (uint64_t)corpus[i];
-				uint64_t n_hash_idx = hash64(pair_n) % 200000000;
-				uint64_t old = atomicAdd(&hashs[n_hash_idx], 1);
-				if (old == 0) {
-					hash_p[n_hash_idx] = pair_n;
-				}
-			}
-			if (i+2 < N) {
-				uint64_t pair_t = ((uint64_t)corpus[i+1] << 32) | (uint64_t)corpus[i + 2];
-				uint64_t hash_idx = hash64(pair_t) % 200000000;
-				atomicAdd(&hashs[hash_idx], -1);
-				uint64_t pair_n = ((uint64_t)corpus[i] << 32) | (uint64_t)corpus[i+2];
-				uint64_t n_hash_idx = hash64(pair_n) % 200000000;
-				uint64_t old = atomicAdd(&hashs[n_hash_idx], 1);
-				if (old == 0) {
-					hash_p[n_hash_idx] = pair_n;
-				}
-			}
+			place[i] = 1;
 		}
-		else {keep[i] = 1; keep[i+1] = 1;}
+		else {
+			place[i] = 0;
+		}
 	}
+}
+
+__global__ void updateHash() {
+	
 }
 
 // CPU helper functions declarations
@@ -100,7 +82,7 @@ __global__ void mergeAndUpdateHash(uint32_t* corpus, uint32_t* hashs, uint64_t* 
 void write() {
 	std::ofstream merge_file("merges.txt", std::ios::app);
 	for (auto& p : merges) {
-		merge_file << (int)(uint32_t)(p >>32) << " " << (int)(uint32_t)(p & 0xFFFFFFFF) << "\n";
+		merge_file << (int)(uint32_t)(p >> 32) << " " << (int)(uint32_t)(p & 0xFFFFFFFF) << "\n";
 	}
 	merge_file.close();
 	std::ofstream vocab_file("vocab.json", std::ios::app);
@@ -177,6 +159,7 @@ uint64_t maxi() {
 	// Copy hash table back to host
 	uint64_t host_most_frequent_pair;
 	cudaMemcpy(&host_most_frequent_pair, &d_pairs_table[max_idx], sizeof(uint64_t), cudaMemcpyDeviceToHost);
+	vocab.emplace(i_vocab[(int)(uint32_t)host_most_frequent_pair >> 32]+i_vocab[(int)(uint32_t)host_most_frequent_pair & 0xFFFFFFFF], new_token_id++);
 	return host_most_frequent_pair;
 }
 
@@ -199,21 +182,13 @@ void merge(uint64_t most_frequent_pair) {
 			int numBlocks = (N + blockSize - 1) / blockSize;
 
 			// Launch kernel to generate pairs
-			mergeAndUpdateHash << <numBlocks, blockSize >> > (d_corpus, d_hash_t, d_pairs_table, N, (uint32_t)new_token_id, most_frequent_pair, keep);
+			findBest << <numBlocks, blockSize >> > (d_corpus, most_frequent_pair, place , N);
 			cudaError_t err = cudaGetLastError();
 			if (err != cudaSuccess)
 				std::cerr << "Kernel launch failed: " << cudaGetErrorString(err) << std::endl;
 
 			// Wait for GPU to finish
 			cudaDeviceSynchronize();
-			auto new_end = thrust::copy_if(thrust::device,
-								d_corpus, d_corpus + N,
-								keep,
-								d_corpus,
-								is_one());
-			size_t new_size = new_end - d_corpus;
-			cudaMemcpy(c.data(), d_corpus, new_size * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-			c.resize(new_size);
 	}
 	cudaEventRecord(stop);
 	cudaEventSynchronize(stop);
@@ -274,7 +249,8 @@ int main() {
 	cudaMalloc(&d_corpus, batch_size * sizeof(uint32_t));
 	cudaMalloc(&d_hash_t, table_size * sizeof(uint32_t));
 	cudaMalloc(&d_pairs_table, table_size * sizeof(uint64_t));
-	cudaMalloc(&keep, batch_size * sizeof(int));
+	cudaMalloc(&new_corpus, batch_size * sizeof(uint32_t));
+	cudaMalloc(&place, batch_size * sizeof(uint32_t));
 
 	hash_table();	
 
@@ -283,5 +259,11 @@ int main() {
 		merge(most_frequent_pair);
 		write();
 	}
+
+	cudaFree(&d_corpus);
+	cudaFree(&d_hash_t);
+	cudaFree(&d_pairs_table);
+	cudaFree(&new_corpus);
+	cudaFree(&place);
 	return 0;
 }
