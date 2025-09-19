@@ -126,12 +126,11 @@ std::vector<std::vector<float>> MultiHeadAttention::forward(const std::vector<st
     // 5) final projection
     return matmul(concat, W_O);
 }
+
 LLM::LLM(int vocab_size, int max_seq_len, int hidden_dim, int num_head)
     : embeding(vocab_size, std::vector<float>(hidden_dim, 0.0f)),
       positionalEncoding(sinusoidalEncoding(max_seq_len, hidden_dim)),
-      transformer(num_head, hidden_dim)
-{
-}
+      transformer(num_head, hidden_dim){}
 
 // temp on the CPU for testing the logic
 std::vector<std::vector<float>> LLM::tokenEmbeding(std::vector<int>& tokens)
